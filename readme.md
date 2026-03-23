@@ -163,3 +163,7 @@ python /ssd/wangab/Top-down/NovaPredict/draw_pcc_distribution.py /ssd/wangab/Top
 - `result_v2_1_charge_pcc_obs.png`
 - `result_v2_1_break.png`
 
+### 改动
+
+```
+1.去掉delta_mass预测头（20260321）

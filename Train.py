@@ -25,6 +25,7 @@ class TrainConfig:
     prsm_dir: str = "/ssd/wangab/DeepDeconv/Result/prsm"
     prsm_pattern: str = "prsm{pid}.csv"
     precursor_charge_col: str = "Charge"
+    n_term_form_col: str = "Protein N-terminal form"
     instrument_col: Optional[str] = None
     energy_col: Optional[str] = None
 
@@ -55,7 +56,6 @@ class TrainConfig:
 
     # loss 权重（按需调整）
     w_intensity: float = 1.0
-    w_dmass: float = 0.2
     w_charge: float = 0.2
     w_break: float = 0.5
     break_prob_threshold: float = 0.5
@@ -99,6 +99,14 @@ INSTRUMENT_TO_ID = {
     "ELITE": 4,
     "FUSION": 5,
     "ORBITRAP": 6,
+}
+
+N_TERM_FORM_TO_ID = {
+    "UNKNOWN": 0,
+    "NONE": 1,
+    "NME": 2,
+    "M_ACETYLATION": 3,
+    "NME_ACETYLATION": 4,
 }
 
 ION_TO_ID = {"B": 0, "Y": 1}
@@ -166,6 +174,13 @@ def encode_precursor_charge(charge: Optional[float], max_charge: int) -> int:
     return max(0, min(max_charge, value))
 
 
+def encode_n_term_form(n_term_form: Optional[str]) -> int:
+    if n_term_form is None or pd.isna(n_term_form):
+        return N_TERM_FORM_TO_ID["UNKNOWN"]
+    normalized = str(n_term_form).strip().upper().replace(" ", "_").replace("-", "_")
+    return N_TERM_FORM_TO_ID.get(normalized, N_TERM_FORM_TO_ID["UNKNOWN"])
+
+
 # -----------------------
 # 2) 从 prsmX.csv 构建 fragment-level 标签序列
 # -----------------------
@@ -181,24 +196,22 @@ def build_targets_from_prsm_csv(
     当第二维顺序固定为 [B, Y] 时，第 k 行表示 [b_(k+1), y_(L-k-1)]。
     标签：
       intensity: float32, padding=0
-      dmass: float32, padding=0
       charge: int64, padding=0 (ignore_index)
       ion_mask: float32, 表示该碎裂点/离子类型是否有监督
             同一 (ion_type, ion_position) 下多条匹配的聚合方式由 cfg.group_label_strategy 控制：
                 - min_error_row: 选取 |mass_error| 最小的单条记录；若 mass_error 不存在，则退化为 |ppm| 最小。
-                - aggregate: intensity 取 max，dmass 取 mean，charge 取众数。
+                - aggregate: intensity 取 max，charge 取众数。
     """
     L = min(seq_len, max_len)
     valid_T = max(0, L - 1)
     T = max(0, max_len - 1)
 
     intensity = np.zeros((T, NUM_ION_TYPES), dtype=np.float32)
-    dmass = np.zeros((T, NUM_ION_TYPES), dtype=np.float32)
     charge = np.zeros((T, NUM_ION_TYPES), dtype=np.int64)
     ion_mask = np.zeros((T, NUM_ION_TYPES), dtype=np.float32)
 
     if valid_T == 0 or df_pr is None or len(df_pr) == 0:
-        return dict(intensity=intensity, dmass=dmass, charge=charge, ion_mask=ion_mask)
+        return dict(intensity=intensity, charge=charge, ion_mask=ion_mask)
 
     use_dmass_col = "mass_error" if "mass_error" in df_pr.columns else ("ppm" if "ppm" in df_pr.columns else None)
 
@@ -240,11 +253,6 @@ def build_targets_from_prsm_csv(
                 if not pd.isna(val):
                     intensity[cleavage_idx, ion_idx] = float(val)
 
-            if use_dmass_col is not None:
-                val = pd.to_numeric(pd.Series([best_row[use_dmass_col]]), errors="coerce").iloc[0]
-                if not pd.isna(val):
-                    dmass[cleavage_idx, ion_idx] = float(val)
-
             if "peak_charge" in g.columns:
                 val = pd.to_numeric(pd.Series([best_row["peak_charge"]]), errors="coerce").iloc[0]
                 if not pd.isna(val):
@@ -256,11 +264,6 @@ def build_targets_from_prsm_csv(
                 vals = pd.to_numeric(g["peak_intensity"], errors="coerce").dropna()
                 if len(vals) > 0:
                     intensity[cleavage_idx, ion_idx] = float(vals.max())
-
-            if use_dmass_col is not None:
-                vals = pd.to_numeric(g[use_dmass_col], errors="coerce").dropna()
-                if len(vals) > 0:
-                    dmass[cleavage_idx, ion_idx] = float(vals.mean())
 
             if "peak_charge" in g.columns:
                 vals = pd.to_numeric(g["peak_charge"], errors="coerce").dropna()
@@ -279,7 +282,7 @@ def build_targets_from_prsm_csv(
         if m > 0:
             intensity = intensity / m
 
-    return dict(intensity=intensity, dmass=dmass, charge=charge, ion_mask=ion_mask)
+    return dict(intensity=intensity, charge=charge, ion_mask=ion_mask)
 
 
 # -----------------------
@@ -289,7 +292,7 @@ class CorePrsmDataset(Dataset):
     def __init__(self, core_df: pd.DataFrame, cfg: TrainConfig):
         self.core = core_df.reset_index(drop=True)
         self.cfg = cfg
-        required = ["Prsm ID", "Proteoform", "Fragmentation", cfg.precursor_charge_col]
+        required = ["Prsm ID", "Proteoform", "Fragmentation", cfg.precursor_charge_col, cfg.n_term_form_col]
         for c in required:
             if c not in self.core.columns:
                 raise KeyError(f"core_train_dedup 缺少列: {c}")
@@ -315,12 +318,14 @@ class CorePrsmDataset(Dataset):
         energy = row[self.cfg.energy_col] if self.cfg.energy_col and self.cfg.energy_col in self.core.columns else None
         instrument = row[self.cfg.instrument_col] if self.cfg.instrument_col and self.cfg.instrument_col in self.core.columns else None
         precursor_charge = row[self.cfg.precursor_charge_col]
+        n_term_form = row[self.cfg.n_term_form_col]
 
         left_ids, right_ids, cleavage_mask, seq_len = encode_cleavage_sequence(seq, self.cfg.max_len)
         frag_id = encode_fragmentation(frag)
         instrument_id = encode_instrument(instrument)
         e_bucket = encode_energy_to_bucket(energy)
         precursor_charge_id = encode_precursor_charge(precursor_charge, self.cfg.max_precursor_charge)
+        n_term_form_id = encode_n_term_form(n_term_form)
 
         df_pr = self._load_prsm_csv(pid)
         targets = build_targets_from_prsm_csv(df_pr, seq_len=seq_len, max_len=self.cfg.max_len, cfg=self.cfg)
@@ -334,9 +339,9 @@ class CorePrsmDataset(Dataset):
             "instrument_id": torch.tensor(instrument_id, dtype=torch.long),
             "e_bucket": torch.tensor(e_bucket, dtype=torch.long),
             "precursor_charge": torch.tensor(precursor_charge_id, dtype=torch.long),
+            "n_term_form_id": torch.tensor(n_term_form_id, dtype=torch.long),
 
             "y_intensity": torch.from_numpy(targets["intensity"]),    # (T, 2)
-            "y_dmass": torch.from_numpy(targets["dmass"]),            # (T, 2)
             "y_charge": torch.from_numpy(targets["charge"]),          # (T, 2)
             "ion_mask": torch.from_numpy(targets["ion_mask"]),        # (T, 2)
         }
@@ -364,8 +369,9 @@ class BiLSTMFragmentPredictor(nn.Module):
         self.instrument_emb = nn.Embedding(max(INSTRUMENT_TO_ID.values()) + 1, cfg.cond_embed_dim)
         self.energy_emb = nn.Embedding(11, cfg.cond_embed_dim)
         self.precursor_charge_emb = nn.Embedding(cfg.max_precursor_charge + 1, cfg.cond_embed_dim)
+        self.n_term_form_emb = nn.Embedding(max(N_TERM_FORM_TO_ID.values()) + 1, cfg.cond_embed_dim)
 
-        in_dim = 2 * cfg.aa_embed_dim + 4 * cfg.cond_embed_dim
+        in_dim = 2 * cfg.aa_embed_dim + 5 * cfg.cond_embed_dim
 
         self.encoder = nn.LSTM(
             input_size=in_dim,
@@ -384,12 +390,6 @@ class BiLSTMFragmentPredictor(nn.Module):
             nn.Dropout(cfg.dropout),
             nn.Linear(cfg.head_hidden, NUM_ION_TYPES),
         )
-        self.dmass_head = nn.Sequential(
-            nn.Linear(enc_dim, cfg.head_hidden),
-            nn.ReLU(),
-            nn.Dropout(cfg.dropout),
-            nn.Linear(cfg.head_hidden, NUM_ION_TYPES),
-        )
         self.charge_head = nn.Sequential(
             nn.Linear(enc_dim, cfg.head_hidden),
             nn.ReLU(),
@@ -403,7 +403,7 @@ class BiLSTMFragmentPredictor(nn.Module):
             nn.Linear(cfg.head_hidden, NUM_ION_TYPES),
         )
 
-    def forward(self, left_ids, right_ids, cleavage_mask, frag_id, instrument_id, e_bucket, precursor_charge):
+    def forward(self, left_ids, right_ids, cleavage_mask, frag_id, instrument_id, e_bucket, precursor_charge, n_term_form_id):
         """
         left_ids/right_ids: (B,T)
         cleavage_mask: (B,T) 1=valid cleavage, 0=pad
@@ -411,6 +411,7 @@ class BiLSTMFragmentPredictor(nn.Module):
         instrument_id: (B,)
         e_bucket: (B,)
         precursor_charge: (B,)
+        n_term_form_id: (B,)
         """
         B, T = left_ids.shape
 
@@ -421,8 +422,9 @@ class BiLSTMFragmentPredictor(nn.Module):
         inst = self.instrument_emb(instrument_id).unsqueeze(1).expand(B, T, -1)
         ene = self.energy_emb(e_bucket).unsqueeze(1).expand(B, T, -1)
         prec = self.precursor_charge_emb(precursor_charge).unsqueeze(1).expand(B, T, -1)
+        n_term = self.n_term_form_emb(n_term_form_id).unsqueeze(1).expand(B, T, -1)
 
-        x = torch.cat([left, right, frag, inst, ene, prec], dim=-1)
+        x = torch.cat([left, right, frag, inst, ene, prec, n_term], dim=-1)
 
         lengths = cleavage_mask.sum(dim=1).long().clamp(min=1).cpu()
         packed = nn.utils.rnn.pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
@@ -430,11 +432,10 @@ class BiLSTMFragmentPredictor(nn.Module):
         h, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True, total_length=T)
 
         pred_int = self.intensity_head(h)
-        pred_dm = self.dmass_head(h)
         pred_ch = self.charge_head(h).view(B, T, NUM_ION_TYPES, self.cfg.charge_num_classes)
         pred_break = self.break_head(h)
 
-        return pred_int, pred_dm, pred_ch, pred_break
+        return pred_int, pred_ch, pred_break
 
 
 # -----------------------
@@ -497,7 +498,7 @@ def train_one_epoch(model, loader, optim, cfg: TrainConfig):
         for k in batch:
             batch[k] = batch[k].to(cfg.device)
 
-        pred_int, pred_dm, pred_ch, pred_break = model(
+        pred_int, pred_ch, pred_break = model(
             batch["left_ids"],
             batch["right_ids"],
             batch["cleavage_mask"],
@@ -505,19 +506,18 @@ def train_one_epoch(model, loader, optim, cfg: TrainConfig):
             batch["instrument_id"],
             batch["e_bucket"],
             batch["precursor_charge"],
+            batch["n_term_form_id"],
         )
 
         mask = batch["cleavage_mask"].unsqueeze(-1) * batch["ion_mask"]
         break_mask = batch["cleavage_mask"].unsqueeze(-1).expand_as(batch["ion_mask"])
 
         loss_int = masked_l1(pred_int, batch["y_intensity"], mask)
-        loss_dm = masked_l1(pred_dm, batch["y_dmass"], mask)
         loss_ch = masked_ce(pred_ch, batch["y_charge"], mask, ignore_index=0)
         loss_break = masked_bce_with_logits(pred_break, batch["ion_mask"], break_mask)
 
         loss = (
             cfg.w_intensity * loss_int
-            + cfg.w_dmass * loss_dm
             + cfg.w_charge * loss_ch
             + cfg.w_break * loss_break
         )
@@ -542,7 +542,7 @@ def validate(model, loader, cfg: TrainConfig):
         for k in batch:
             batch[k] = batch[k].to(cfg.device)
 
-        pred_int, pred_dm, pred_ch, pred_break = model(
+        pred_int, pred_ch, pred_break = model(
             batch["left_ids"],
             batch["right_ids"],
             batch["cleavage_mask"],
@@ -550,17 +550,16 @@ def validate(model, loader, cfg: TrainConfig):
             batch["instrument_id"],
             batch["e_bucket"],
             batch["precursor_charge"],
+            batch["n_term_form_id"],
         )
         mask = batch["cleavage_mask"].unsqueeze(-1) * batch["ion_mask"]
         break_mask = batch["cleavage_mask"].unsqueeze(-1).expand_as(batch["ion_mask"])
 
         loss_int = masked_l1(pred_int, batch["y_intensity"], mask)
-        loss_dm = masked_l1(pred_dm, batch["y_dmass"], mask)
         loss_ch = masked_ce(pred_ch, batch["y_charge"], mask, ignore_index=0)
         loss_break = masked_bce_with_logits(pred_break, batch["ion_mask"], break_mask)
         loss = (
             cfg.w_intensity * loss_int
-            + cfg.w_dmass * loss_dm
             + cfg.w_charge * loss_ch
             + cfg.w_break * loss_break
         )

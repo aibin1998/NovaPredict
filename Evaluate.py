@@ -182,7 +182,7 @@ def evaluate_spectral_similarity(model, loader, cfg: Any) -> Dict[str, float]:
 		for k in batch:
 			batch[k] = batch[k].to(cfg.device)
 
-		pred_int, _, pred_ch, pred_break = model(
+		pred_int, pred_ch, pred_break = model(
 			batch["left_ids"],
 			batch["right_ids"],
 			batch["cleavage_mask"],
@@ -190,6 +190,7 @@ def evaluate_spectral_similarity(model, loader, cfg: Any) -> Dict[str, float]:
 			batch["instrument_id"],
 			batch["e_bucket"],
 			batch["precursor_charge"],
+			batch["n_term_form_id"],
 		)
 		batch_pcc = batch_intensity_pcc(
 			pred_int,
