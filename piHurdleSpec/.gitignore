@@ -1,5 +1,14 @@
+.venv/
 __pycache__/
 *.py[cod]
-*.pid
+.pytest_cache/
+*.hdf5
+*.h5
+*.msalign
+outputs/
+*.pt
+!weights/*.pt
+*.pth
+*.ckpt
 *.log
-log*/
+*.pid

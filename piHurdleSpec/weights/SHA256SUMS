@@ -1,0 +1,2 @@
+60f605c527560ed0dca07858451a9337a8b12df6502eb26702043e801dbca1ab  weights/cnn_bilstm_best.pt
+affffa8a0c57ad81080f86a7f082f00d79e9ccf5e519a2d2a943f6cf8c78da92  weights/logmvn_best.pt

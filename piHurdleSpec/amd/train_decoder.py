@@ -27,11 +27,9 @@ from model import MultiChargeHurdleMVN
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_DATA = "/data/wangab/data/TD-repo/HDF/mutil_charge"
-DEFAULT_STAGE1 = (
-    "/data/wangab/Top-down/NovaPredict/"
-    "NovaPredict_CNN_BiLSTM_MultiCharge_Hurdle_MVN_TwoStage/"
-    "lambda_ablation/shared_stage1/stage1_best.pt"
+DEFAULT_DATA = os.path.join(os.path.dirname(HERE), "data")
+DEFAULT_STAGE1 = os.path.join(
+    os.path.dirname(HERE), "outputs", "amd", "stage1", "stage1_best.pt"
 )
 
 
@@ -126,6 +124,14 @@ def run_epoch(
                 )
             scaler.scale(components["total"]).backward()
             scaler.unscale_(optimizer)
+            if device.type == "cuda" and torch.version.hip is not None and batch_index < 2:
+                encoder_grad = stage1.encoder.weight_ih_l0.grad
+                if (
+                    encoder_grad is None
+                    or not bool(torch.isfinite(encoder_grad).all())
+                    or not bool(encoder_grad.abs().max() > 0)
+                ):
+                    raise RuntimeError("ROCm encoder gradient vanished; check the LSTM backend")
             torch.nn.utils.clip_grad_norm_(
                 list(stage1.parameters()) + list(decoder.parameters()), 5.0
             )
@@ -234,7 +240,7 @@ def parse_args() -> argparse.Namespace:
         "--train-hdf5", default=os.path.join(DEFAULT_DATA, "train_multi_charge.hdf5")
     )
     parser.add_argument(
-        "--val-hdf5", default=os.path.join(DEFAULT_DATA, "test_multi_charge.hdf5")
+        "--val-hdf5", default=os.path.join(DEFAULT_DATA, "val_multi_charge.hdf5")
     )
     parser.add_argument("--stage1-checkpoint", default=DEFAULT_STAGE1)
     parser.add_argument("--out-dir", default=os.path.join(HERE, "log"))
@@ -247,7 +253,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shuffle-block-size", type=int, default=2048)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seed", type=int, default=1337)
-    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--max-train-samples", type=int)
     parser.add_argument("--max-val-samples", type=int)
     parser.add_argument("--max-train-batches", type=int)
@@ -271,6 +277,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.device.startswith("cuda") and torch.version.hip is None:
+        raise RuntimeError("The AMD entry point requires a ROCm-enabled PyTorch build")
+    if args.amp:
+        raise ValueError("FP16 AMP is disabled for the validated ROCm training path")
+    # Keep the model's LSTM dropout while avoiding the tested MIOpen backward issue.
+    torch.backends.cudnn.enabled = False
     if args.epochs < 1:
         raise ValueError("--epochs must be positive")
     if args.stage2_distribution_weight < 0.0:
